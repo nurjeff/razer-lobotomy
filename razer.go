@@ -2,7 +2,6 @@ package main
 
 import (
 	"fmt"
-	"math"
 	"time"
 
 	"golang.org/x/sys/windows"
@@ -17,7 +16,13 @@ const (
 )
 
 type razerBatteryProvider struct {
-	profiles []razerHardwareProfile
+	profiles   []razerHardwareProfile
+	results    []batteryReading
+	candidates []hidDeviceInfo
+	skipped    []hidDeviceInfo
+	warnings   []string
+	request    [razerReportLength]byte
+	response   [razerReportLength]byte
 }
 
 type razerHardwareProfile struct {
@@ -69,38 +74,38 @@ func (registry *razerProfileRegistry) Register(profile razerHardwareProfile) {
 }
 
 func (registry *razerProfileRegistry) Profiles() []razerHardwareProfile {
-	profiles := make([]razerHardwareProfile, len(registry.profiles))
-	copy(profiles, registry.profiles)
-	return profiles
+	return registry.profiles
 }
 
 func (provider *razerBatteryProvider) Collect(devices []hidDeviceInfo) ([]batteryReading, []string) {
-	results := make([]batteryReading, 0)
-	candidates := make([]hidDeviceInfo, 0)
-	skipped := make([]hidDeviceInfo, 0)
+	provider.results = provider.results[:0]
+	provider.candidates = provider.candidates[:0]
+	provider.skipped = provider.skipped[:0]
+	provider.warnings = provider.warnings[:0]
 
 	for _, device := range devices {
 		if device.VendorID != razerVendorID {
 			continue
 		}
-		candidates = append(candidates, device)
+		provider.candidates = append(provider.candidates, device)
 
 		profile, ok := provider.profileFor(device)
 		if !ok {
-			skipped = append(skipped, device)
+			provider.skipped = append(provider.skipped, device)
 			continue
 		}
 
-		reading, ok := tryRazerBattery(device, profile)
+		reading, ok := provider.tryRazerBattery(device, profile)
 		if !ok {
-			skipped = append(skipped, device)
+			provider.skipped = append(provider.skipped, device)
 			continue
 		}
 
-		results = append(results, reading)
+		provider.results = append(provider.results, reading)
 	}
 
-	return results, providerWarnings(candidates, skipped, len(results) > 0)
+	provider.warnings = providerWarnings(provider.warnings[:0], provider.candidates, provider.skipped, len(provider.results) > 0)
+	return provider.results, provider.warnings
 }
 
 func (provider *razerBatteryProvider) profileFor(device hidDeviceInfo) (razerHardwareProfile, bool) {
@@ -112,12 +117,12 @@ func (provider *razerBatteryProvider) profileFor(device hidDeviceInfo) (razerHar
 	return razerHardwareProfile{}, false
 }
 
-func providerWarnings(candidates []hidDeviceInfo, skipped []hidDeviceInfo, haveResults bool) []string {
+func providerWarnings(warnings []string, candidates []hidDeviceInfo, skipped []hidDeviceInfo, haveResults bool) []string {
 	if len(candidates) == 0 {
 		return nil
 	}
 
-	warnings := make([]string, 0)
+	warnings = warnings[:0]
 	if !haveResults {
 		warnings = append(warnings, "Found Razer HID interfaces, but none of them returned a battery report.")
 		warnings = append(warnings, "That usually means the device needs a model-specific Razer profile.")
@@ -134,8 +139,8 @@ func providerWarnings(candidates []hidDeviceInfo, skipped []hidDeviceInfo, haveR
 	return warnings
 }
 
-func tryRazerBattery(device hidDeviceInfo, profile razerHardwareProfile) (batteryReading, bool) {
-	handle, err := openHIDDevice(device.Path)
+func (provider *razerBatteryProvider) tryRazerBattery(device hidDeviceInfo, profile razerHardwareProfile) (batteryReading, bool) {
+	handle, err := openHIDDeviceInfo(device)
 	if err != nil {
 		return batteryReading{}, false
 	}
@@ -143,23 +148,21 @@ func tryRazerBattery(device hidDeviceInfo, profile razerHardwareProfile) (batter
 
 	for _, transactionID := range profile.TransactionIDs {
 		for _, reportID := range profile.ReportIDs {
-			rawBattery, ok := queryRazerValue(handle, reportID, transactionID, razerCommandBattery)
+			rawBattery, ok := provider.queryRazerValue(handle, reportID, transactionID, razerCommandBattery)
 			if !ok {
 				continue
 			}
 
 			percent := scaleRazerBattery(rawBattery)
-			chargingValue, chargingOK := queryRazerValue(handle, reportID, transactionID, razerCommandCharging)
+			chargingValue, chargingOK := provider.queryRazerValue(handle, reportID, transactionID, razerCommandCharging)
 
 			reading := batteryReading{
-				Device:  device,
-				Percent: percent,
-				Raw:     rawBattery,
-				Backend: fmt.Sprintf("Razer profile %s report 0x%02X transaction 0x%02X", profile.Name, reportID, transactionID),
-			}
-			if chargingOK {
-				charging := chargingValue != 0
-				reading.Charging = &charging
+				Device:      device,
+				Percent:     percent,
+				Raw:         rawBattery,
+				HasCharging: chargingOK,
+				Charging:    chargingValue != 0,
+				Backend:     fmt.Sprintf("Razer profile %s report 0x%02X transaction 0x%02X", profile.Name, reportID, transactionID),
 			}
 
 			return reading, true
@@ -169,29 +172,30 @@ func tryRazerBattery(device hidDeviceInfo, profile razerHardwareProfile) (batter
 	return batteryReading{}, false
 }
 
-func queryRazerValue(handle windows.Handle, reportID byte, transactionID byte, commandID byte) (byte, bool) {
-	report := buildRazerRequest(reportID, transactionID, commandID)
-	if err := hidSetFeature(handle, report); err != nil {
+func (provider *razerBatteryProvider) queryRazerValue(handle windows.Handle, reportID byte, transactionID byte, commandID byte) (byte, bool) {
+	request := provider.request[:]
+	response := provider.response[:]
+	clear(request)
+	buildRazerRequest(request, reportID, transactionID, commandID)
+	if err := hidSetFeature(handle, request); err != nil {
 		return 0, false
 	}
 
 	time.Sleep(8 * time.Millisecond)
 
-	response := make([]byte, razerReportLength)
-	response[0] = report[0]
+	response[0] = request[0]
 	if err := hidGetFeature(handle, response); err != nil {
 		return 0, false
 	}
 
-	if !isValidRazerResponse(report, response) {
+	if !isValidRazerResponse(request, response) {
 		return 0, false
 	}
 
 	return response[10], true
 }
 
-func buildRazerRequest(reportID byte, transactionID byte, commandID byte) []byte {
-	report := make([]byte, razerReportLength)
+func buildRazerRequest(report []byte, reportID byte, transactionID byte, commandID byte) {
 	report[0] = reportID
 	report[1] = 0x00
 	report[2] = transactionID
@@ -202,7 +206,6 @@ func buildRazerRequest(reportID byte, transactionID byte, commandID byte) []byte
 	report[7] = razerCommandClassPower
 	report[8] = commandID
 	report[89] = razerCRC(report)
-	return report
 }
 
 func isValidRazerResponse(request []byte, response []byte) bool {
@@ -230,7 +233,7 @@ func razerCRC(report []byte) byte {
 }
 
 func scaleRazerBattery(raw byte) int {
-	percent := int(math.Round(float64(raw) * 100.0 / 255.0))
+	percent := (int(raw)*100 + 127) / 255
 	if percent < 0 {
 		return 0
 	}

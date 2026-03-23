@@ -3,7 +3,7 @@ package main
 import (
 	"bytes"
 	"encoding/binary"
-	"math"
+	"sync"
 )
 
 type iconPixel struct {
@@ -13,7 +13,38 @@ type iconPixel struct {
 	a uint8
 }
 
+var (
+	trayIconCache     [4][101][]byte
+	trayIconCacheOnce sync.Once
+)
+
 func buildTrayIcon(percent int, charging bool, alert bool) []byte {
+	trayIconCacheOnce.Do(precomputeTrayIcons)
+	percent = clampPercent(percent)
+	return trayIconCache[iconVariantIndex(charging, alert)][percent]
+}
+
+func precomputeTrayIcons() {
+	for percent := 0; percent <= 100; percent++ {
+		trayIconCache[iconVariantIndex(false, false)][percent] = buildTrayIconBytes(percent, false, false)
+		trayIconCache[iconVariantIndex(true, false)][percent] = buildTrayIconBytes(percent, true, false)
+		trayIconCache[iconVariantIndex(false, true)][percent] = buildTrayIconBytes(percent, false, true)
+		trayIconCache[iconVariantIndex(true, true)][percent] = buildTrayIconBytes(percent, true, true)
+	}
+}
+
+func iconVariantIndex(charging bool, alert bool) int {
+	index := 0
+	if charging {
+		index |= 1
+	}
+	if alert {
+		index |= 2
+	}
+	return index
+}
+
+func buildTrayIconBytes(percent int, charging bool, alert bool) []byte {
 	percent = clampPercent(percent)
 	pixels := make([]iconPixel, 16*16)
 
@@ -25,7 +56,7 @@ func buildTrayIcon(percent int, charging bool, alert bool) []byte {
 	drawRect(pixels, 13, 6, 15, 10, outline)
 	drawRect(pixels, 2, 5, 12, 11, background)
 
-	fillWidth := int(math.Round(float64(percent) * 10.0 / 100.0))
+	fillWidth := (percent*10 + 50) / 100
 	if percent > 0 && fillWidth == 0 {
 		fillWidth = 1
 	}

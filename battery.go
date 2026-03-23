@@ -2,16 +2,18 @@ package main
 
 import (
 	"sort"
-	"strings"
 	"time"
 )
 
+var defaultBatteryMonitor = newBatteryMonitor()
+
 type batteryReading struct {
-	Device   hidDeviceInfo
-	Percent  int
-	Raw      byte
-	Charging *bool
-	Backend  string
+	Device      hidDeviceInfo
+	Percent     int
+	Raw         byte
+	Charging    bool
+	HasCharging bool
+	Backend     string
 }
 
 type batterySnapshot struct {
@@ -21,54 +23,114 @@ type batterySnapshot struct {
 	UpdatedAt time.Time
 }
 
+type batteryMonitor struct {
+	enumerator   *hidEnumerator
+	providers    []batteryProvider
+	results      []batteryReading
+	warnings     []string
+	seen         map[string]struct{}
+	lastSnapshot batterySnapshot
+	hasSnapshot  bool
+}
+
 func run() error {
 	return runTrayApp()
 }
 
+func newBatteryMonitor() *batteryMonitor {
+	return &batteryMonitor{
+		enumerator: newHIDEnumerator(),
+		providers:  windowsBatteryProviders(),
+		seen:       make(map[string]struct{}),
+	}
+}
+
 func collectBatterySnapshot() batterySnapshot {
-	snapshot := batterySnapshot{UpdatedAt: time.Now()}
-
-	devices, err := enumerateHIDDevices()
-	if err != nil {
-		snapshot.Err = err
-		return snapshot
-	}
-
-	snapshot.Readings, snapshot.Warnings = collectBatteryReadings(devices, windowsBatteryProviders())
-	if len(snapshot.Readings) == 0 && len(snapshot.Warnings) == 0 {
-		snapshot.Warnings = append(snapshot.Warnings, "No supported battery-capable devices detected.")
-	}
-
+	snapshot, _ := defaultBatteryMonitor.collectSnapshotIfChanged()
 	return snapshot
 }
 
 func collectBatteryReadings(devices []hidDeviceInfo, providers []batteryProvider) ([]batteryReading, []string) {
-	results := make([]batteryReading, 0)
-	warnings := make([]string, 0)
-	seen := make(map[string]struct{})
+	monitor := batteryMonitor{providers: providers, seen: make(map[string]struct{})}
+	monitor.collectReadings(devices)
+	return monitor.results, monitor.warnings
+}
 
-	for _, provider := range providers {
+func (monitor *batteryMonitor) collectSnapshot() batterySnapshot {
+	snapshot, _ := monitor.collectSnapshotIfChanged()
+	return snapshot
+}
+
+func (monitor *batteryMonitor) collectSnapshotIfChanged() (batterySnapshot, bool) {
+	snapshot := batterySnapshot{UpdatedAt: time.Now()}
+
+	devices, err := monitor.enumerator.Enumerate()
+	if err != nil {
+		snapshot.Err = err
+		if monitor.hasSnapshot && snapshotsEqual(monitor.lastSnapshot, snapshot) {
+			return batterySnapshot{}, false
+		}
+		monitor.lastSnapshot = snapshot
+		monitor.hasSnapshot = true
+		return snapshot, true
+	}
+
+	monitor.collectReadings(devices)
+	if len(monitor.results) == 0 && len(monitor.warnings) == 0 {
+		monitor.warnings = append(monitor.warnings, "No supported battery-capable devices detected.")
+	}
+
+	snapshot.Readings = monitor.results
+	snapshot.Warnings = monitor.warnings
+	if monitor.hasSnapshot && snapshotsEqual(monitor.lastSnapshot, snapshot) {
+		return batterySnapshot{}, false
+	}
+
+	if len(monitor.results) > 0 {
+		snapshot.Readings = make([]batteryReading, len(monitor.results))
+		copy(snapshot.Readings, monitor.results)
+	}
+	if len(monitor.warnings) > 0 {
+		snapshot.Warnings = make([]string, len(monitor.warnings))
+		copy(snapshot.Warnings, monitor.warnings)
+	}
+	monitor.lastSnapshot = snapshot
+	monitor.hasSnapshot = true
+
+	return snapshot, true
+}
+
+func (monitor *batteryMonitor) collectReadings(devices []hidDeviceInfo) {
+	monitor.results = monitor.results[:0]
+	monitor.warnings = monitor.warnings[:0]
+	clearSeenSet(monitor.seen)
+
+	for _, provider := range monitor.providers {
 		providerReadings, providerWarnings := provider.Collect(devices)
-		warnings = append(warnings, providerWarnings...)
+		monitor.warnings = append(monitor.warnings, providerWarnings...)
 
 		for _, reading := range providerReadings {
-			key := normalizeDeviceKey(reading.Device.Path, reading.Device.VendorID, reading.Device.ProductID)
-			if _, exists := seen[key]; exists {
+			key := deviceKey(reading.Device)
+			if _, exists := monitor.seen[key]; exists {
 				continue
 			}
-			seen[key] = struct{}{}
-			results = append(results, reading)
+			monitor.seen[key] = struct{}{}
+			monitor.results = append(monitor.results, reading)
 		}
 	}
 
-	sort.Slice(results, func(i, j int) bool {
-		left := strings.ToLower(deviceLabel(results[i].Device))
-		right := strings.ToLower(deviceLabel(results[j].Device))
+	sort.Slice(monitor.results, func(i, j int) bool {
+		left := deviceSortKey(monitor.results[i].Device)
+		right := deviceSortKey(monitor.results[j].Device)
 		if left == right {
-			return normalizeDeviceKey(results[i].Device.Path, results[i].Device.VendorID, results[i].Device.ProductID) < normalizeDeviceKey(results[j].Device.Path, results[j].Device.VendorID, results[j].Device.ProductID)
+			return deviceKey(monitor.results[i].Device) < deviceKey(monitor.results[j].Device)
 		}
 		return left < right
 	})
+}
 
-	return results, warnings
+func clearSeenSet(values map[string]struct{}) {
+	for key := range values {
+		delete(values, key)
+	}
 }

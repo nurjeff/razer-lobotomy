@@ -2,7 +2,6 @@ package main
 
 import (
 	"fmt"
-	"strings"
 	"sync"
 	"time"
 
@@ -30,6 +29,14 @@ type trayApp struct {
 
 	deviceItems  []*systray.MenuItem
 	warningItems []*systray.MenuItem
+	lastSnapshot *batterySnapshot
+	lastIcon     trayIconState
+}
+
+type trayIconState struct {
+	percent  int
+	charging bool
+	alert    bool
 }
 
 func runTrayApp() error {
@@ -47,7 +54,8 @@ func runTrayApp() error {
 func (app *trayApp) onReady() {
 	systray.SetTitle("Battery Driver")
 	systray.SetTooltip("Starting battery monitor")
-	systray.SetIcon(buildTrayIcon(100, false, true))
+	app.lastIcon = trayIconState{percent: 100, alert: true}
+	systray.SetIcon(buildTrayIcon(app.lastIcon.percent, app.lastIcon.charging, app.lastIcon.alert))
 
 	app.statusItem = systray.AddMenuItem("Starting battery monitor...", "")
 	app.statusItem.Disable()
@@ -100,7 +108,10 @@ func (app *trayApp) collectLoop() {
 }
 
 func (app *trayApp) publishSnapshot() {
-	snapshot := collectBatterySnapshot()
+	snapshot, changed := defaultBatteryMonitor.collectSnapshotIfChanged()
+	if !changed {
+		return
+	}
 	select {
 	case app.snapshotCh <- snapshot:
 	case <-app.stopCh:
@@ -125,18 +136,26 @@ func (app *trayApp) eventLoop() {
 }
 
 func (app *trayApp) applySnapshot(snapshot batterySnapshot) {
+	if app.lastSnapshot != nil && snapshotsEqual(*app.lastSnapshot, snapshot) {
+		return
+	}
+
 	summary := app.summaryLine(snapshot)
 	app.statusItem.SetTitle(summary)
 	app.statusItem.SetTooltip(summary)
 	app.updatedItem.SetTitle("Last updated: " + snapshot.UpdatedAt.Format("15:04:05"))
 	app.updatedItem.SetTooltip(snapshot.UpdatedAt.Format(time.RFC3339))
 
-	iconPercent, charging, problem := snapshotIconState(snapshot)
-	systray.SetIcon(buildTrayIcon(iconPercent, charging, problem))
+	iconState := snapshotIconState(snapshot)
+	if iconState != app.lastIcon {
+		app.lastIcon = iconState
+		systray.SetIcon(buildTrayIcon(iconState.percent, iconState.charging, iconState.alert))
+	}
 	systray.SetTooltip(buildTooltip(summary, snapshot))
 
 	app.syncDeviceItems(snapshot)
 	app.syncWarningItems(snapshot)
+	app.lastSnapshot = cloneSnapshot(snapshot)
 }
 
 func (app *trayApp) summaryLine(snapshot batterySnapshot) string {
@@ -151,7 +170,7 @@ func (app *trayApp) summaryLine(snapshot batterySnapshot) string {
 
 	chargingCount := 0
 	for _, reading := range snapshot.Readings {
-		if reading.Charging != nil && *reading.Charging {
+		if reading.HasCharging && reading.Charging {
 			chargingCount++
 		}
 	}
@@ -229,33 +248,40 @@ func ensureSubmenuItems(parent *systray.MenuItem, items []*systray.MenuItem, cou
 
 func formatReadingLine(reading batteryReading) string {
 	line := fmt.Sprintf("%s: %d%%", deviceLabel(reading.Device), reading.Percent)
-	if reading.Charging != nil && *reading.Charging {
+	if reading.HasCharging && reading.Charging {
 		line += " charging"
 	}
 	return line
 }
 
 func buildTooltip(summary string, snapshot batterySnapshot) string {
-	lines := []string{summary}
+	buf := make([]byte, 0, maxTooltipLength)
+	buf = append(buf, summary...)
 
 	if snapshot.Err != nil {
-		lines = append(lines, snapshot.Err.Error())
-		return truncateTooltip(strings.Join(lines, "\n"))
+		buf = appendTooltipLine(buf, snapshot.Err.Error())
+		return truncateTooltip(string(buf))
 	}
 
 	for index, reading := range snapshot.Readings {
 		if index == 3 {
-			lines = append(lines, fmt.Sprintf("+%d more device(s)", len(snapshot.Readings)-index))
+			buf = appendTooltipLine(buf, fmt.Sprintf("+%d more device(s)", len(snapshot.Readings)-index))
 			break
 		}
-		lines = append(lines, formatReadingLine(reading))
+		buf = appendTooltipLine(buf, formatReadingLine(reading))
 	}
 
 	if len(snapshot.Readings) == 0 && len(snapshot.Warnings) > 0 {
-		lines = append(lines, snapshot.Warnings[0])
+		buf = appendTooltipLine(buf, snapshot.Warnings[0])
 	}
 
-	return truncateTooltip(strings.Join(lines, "\n"))
+	return truncateTooltip(string(buf))
+}
+
+func appendTooltipLine(buf []byte, line string) []byte {
+	buf = append(buf, '\n')
+	buf = append(buf, line...)
+	return buf
 }
 
 func truncateTooltip(value string) string {
@@ -268,9 +294,9 @@ func truncateTooltip(value string) string {
 	return value[:maxTooltipLength-3] + "..."
 }
 
-func snapshotIconState(snapshot batterySnapshot) (int, bool, bool) {
+func snapshotIconState(snapshot batterySnapshot) trayIconState {
 	if len(snapshot.Readings) == 0 {
-		return 0, false, true
+		return trayIconState{percent: 0, charging: false, alert: true}
 	}
 
 	lowest := 100
@@ -279,10 +305,71 @@ func snapshotIconState(snapshot batterySnapshot) (int, bool, bool) {
 		if reading.Percent < lowest {
 			lowest = reading.Percent
 		}
-		if reading.Charging != nil && *reading.Charging {
+		if reading.HasCharging && reading.Charging {
 			charging = true
 		}
 	}
 
-	return lowest, charging, snapshot.Err != nil
+	return trayIconState{percent: lowest, charging: charging, alert: snapshot.Err != nil}
+}
+
+func snapshotsEqual(left batterySnapshot, right batterySnapshot) bool {
+	if (left.Err == nil) != (right.Err == nil) {
+		return false
+	}
+	if left.Err != nil && left.Err.Error() != right.Err.Error() {
+		return false
+	}
+	if len(left.Warnings) != len(right.Warnings) || len(left.Readings) != len(right.Readings) {
+		return false
+	}
+	for index := range left.Warnings {
+		if left.Warnings[index] != right.Warnings[index] {
+			return false
+		}
+	}
+	for index := range left.Readings {
+		if !readingsEqual(left.Readings[index], right.Readings[index]) {
+			return false
+		}
+	}
+	return true
+}
+
+func readingsEqual(left batteryReading, right batteryReading) bool {
+	if left.Device.Path != right.Device.Path || left.Device.VendorID != right.Device.VendorID || left.Device.ProductID != right.Device.ProductID {
+		return false
+	}
+	if left.Percent != right.Percent || left.Raw != right.Raw || left.Backend != right.Backend {
+		return false
+	}
+	if left.HasCharging != right.HasCharging {
+		return false
+	}
+	if left.Charging != right.Charging {
+		return false
+	}
+	return true
+}
+
+func cloneSnapshot(snapshot batterySnapshot) *batterySnapshot {
+	clone := batterySnapshot{
+		Err:       snapshot.Err,
+		UpdatedAt: snapshot.UpdatedAt,
+	}
+	if len(snapshot.Readings) > 0 {
+		clone.Readings = make([]batteryReading, len(snapshot.Readings))
+		for index, reading := range snapshot.Readings {
+			clone.Readings[index] = cloneReading(reading)
+		}
+	}
+	if len(snapshot.Warnings) > 0 {
+		clone.Warnings = make([]string, len(snapshot.Warnings))
+		copy(clone.Warnings, snapshot.Warnings)
+	}
+	return &clone
+}
+
+func cloneReading(reading batteryReading) batteryReading {
+	return reading
 }

@@ -3,7 +3,6 @@ package main
 import (
 	"errors"
 	"fmt"
-	"regexp"
 	"strings"
 	"unsafe"
 
@@ -34,8 +33,6 @@ var (
 	procHidDGetFeature            = modHID.NewProc("HidD_GetFeature")
 	procHidDSetFeature            = modHID.NewProc("HidD_SetFeature")
 	procHidPGetCaps               = modHID.NewProc("HidP_GetCaps")
-
-	collectionSuffixRE = regexp.MustCompile(`(?i)&col[0-9a-f]{2}`)
 )
 
 type hidDeviceInfo struct {
@@ -47,6 +44,19 @@ type hidDeviceInfo struct {
 	FeatureReportByteLength uint16
 	Manufacturer            string
 	Product                 string
+	DisplayLabel            string
+	SortKey                 string
+	NormalizedKey           string
+	pathUTF16               []uint16
+}
+
+type hidEnumerator struct {
+	deviceCache      map[string]hidDeviceInfo
+	deviceGeneration map[string]uint64
+	generation       uint64
+	detailBuffer     []byte
+	stringBuffer     []uint16
+	devices          []hidDeviceInfo
 }
 
 type spDeviceInterfaceData struct {
@@ -82,7 +92,19 @@ type hidpCaps struct {
 	numberFeatureDataIndices  uint16
 }
 
+func newHIDEnumerator() *hidEnumerator {
+	return &hidEnumerator{
+		deviceCache:      make(map[string]hidDeviceInfo),
+		deviceGeneration: make(map[string]uint64),
+		stringBuffer:     make([]uint16, 126),
+	}
+}
+
 func enumerateHIDDevices() ([]hidDeviceInfo, error) {
+	return newHIDEnumerator().Enumerate()
+}
+
+func (enumerator *hidEnumerator) Enumerate() ([]hidDeviceInfo, error) {
 	hidGUID, err := getHIDGUID()
 	if err != nil {
 		return nil, err
@@ -94,9 +116,10 @@ func enumerateHIDDevices() ([]hidDeviceInfo, error) {
 	}
 	defer setupDiDestroyDeviceInfoList(infoSet)
 
-	devices := make([]hidDeviceInfo, 0)
+	enumerator.generation++
+	enumerator.devices = enumerator.devices[:0]
 	for index := uint32(0); ; index++ {
-		path, err := setupDiEnumDeviceInterfacePath(infoSet, hidGUID, index)
+		path, err := enumerator.setupDiEnumDeviceInterfacePath(infoSet, hidGUID, index)
 		if errors.Is(err, windows.ERROR_NO_MORE_ITEMS) {
 			break
 		}
@@ -104,18 +127,42 @@ func enumerateHIDDevices() ([]hidDeviceInfo, error) {
 			return nil, err
 		}
 
-		device, ok := inspectHIDDevice(path)
+		if device, ok := enumerator.deviceCache[path]; ok {
+			enumerator.deviceGeneration[path] = enumerator.generation
+			enumerator.devices = append(enumerator.devices, device)
+			continue
+		}
+
+		pathUTF16, err := windows.UTF16FromString(path)
+		if err != nil {
+			continue
+		}
+
+		device, ok := inspectHIDDevice(path, pathUTF16, enumerator.stringBuffer)
 		if !ok {
 			continue
 		}
-		devices = append(devices, device)
+		enumerator.deviceCache[path] = device
+		enumerator.deviceGeneration[path] = enumerator.generation
+		enumerator.devices = append(enumerator.devices, device)
 	}
+	enumerator.evictStaleDevices()
 
-	return devices, nil
+	return enumerator.devices, nil
 }
 
-func inspectHIDDevice(path string) (hidDeviceInfo, bool) {
-	handle, err := openHIDDevice(path)
+func (enumerator *hidEnumerator) evictStaleDevices() {
+	for path, generation := range enumerator.deviceGeneration {
+		if generation == enumerator.generation {
+			continue
+		}
+		delete(enumerator.deviceGeneration, path)
+		delete(enumerator.deviceCache, path)
+	}
+}
+
+func inspectHIDDevice(path string, pathUTF16 []uint16, stringBuffer []uint16) (hidDeviceInfo, bool) {
+	handle, err := openHIDDeviceUTF16(pathUTF16)
 	if err != nil {
 		return hidDeviceInfo{}, false
 	}
@@ -131,8 +178,14 @@ func inspectHIDDevice(path string) (hidDeviceInfo, bool) {
 		return hidDeviceInfo{}, false
 	}
 
-	manufacturer, _ := hidGetString(handle, procHidDGetManufacturerString)
-	product, _ := hidGetString(handle, procHidDGetProductString)
+	manufacturer, _ := hidGetString(handle, procHidDGetManufacturerString, stringBuffer)
+	product, _ := hidGetString(handle, procHidDGetProductString, stringBuffer)
+	label := path
+	if product != "" {
+		label = product
+	} else if manufacturer != "" {
+		label = manufacturer + " device"
+	}
 
 	return hidDeviceInfo{
 		Path:                    path,
@@ -143,14 +196,30 @@ func inspectHIDDevice(path string) (hidDeviceInfo, bool) {
 		FeatureReportByteLength: caps.featureReportByteLength,
 		Manufacturer:            manufacturer,
 		Product:                 product,
+		DisplayLabel:            label,
+		SortKey:                 strings.ToLower(label),
+		NormalizedKey:           normalizeDeviceKey(path, attributes.vendorID, attributes.productID),
+		pathUTF16:               pathUTF16,
 	}, true
 }
 
 func openHIDDevice(path string) (windows.Handle, error) {
-	pathPtr, err := windows.UTF16PtrFromString(path)
+	pathUTF16, err := windows.UTF16FromString(path)
 	if err != nil {
 		return 0, err
 	}
+	return openHIDDeviceUTF16(pathUTF16)
+}
+
+func openHIDDeviceInfo(device hidDeviceInfo) (windows.Handle, error) {
+	if len(device.pathUTF16) > 0 {
+		return openHIDDeviceUTF16(device.pathUTF16)
+	}
+	return openHIDDevice(device.Path)
+}
+
+func openHIDDeviceUTF16(pathUTF16 []uint16) (windows.Handle, error) {
+	pathPtr := &pathUTF16[0]
 
 	handle, err := windows.CreateFile(
 		pathPtr,
@@ -163,7 +232,7 @@ func openHIDDevice(path string) (windows.Handle, error) {
 	)
 	if err != nil {
 		handle, fallbackErr := windows.CreateFile(
-			pathPtr,
+			&pathUTF16[0],
 			0,
 			windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE,
 			nil,
@@ -203,7 +272,7 @@ func setupDiGetClassDevs(classGUID *windows.GUID) (windows.Handle, error) {
 	return handle, nil
 }
 
-func setupDiEnumDeviceInterfacePath(infoSet windows.Handle, classGUID *windows.GUID, index uint32) (string, error) {
+func (enumerator *hidEnumerator) setupDiEnumDeviceInterfacePath(infoSet windows.Handle, classGUID *windows.GUID, index uint32) (string, error) {
 	interfaceData := spDeviceInterfaceData{cbSize: uint32(unsafe.Sizeof(spDeviceInterfaceData{}))}
 	r1, _, err := procSetupDiEnumDeviceInterfaces.Call(
 		uintptr(infoSet),
@@ -229,13 +298,16 @@ func setupDiEnumDeviceInterfacePath(infoSet windows.Handle, classGUID *windows.G
 		return "", err
 	}
 
-	buffer := make([]byte, requiredSize)
-	*(*uint32)(unsafe.Pointer(&buffer[0])) = detailDataCBSize()
+	if uint32(cap(enumerator.detailBuffer)) < requiredSize {
+		enumerator.detailBuffer = make([]byte, requiredSize)
+	}
+	enumerator.detailBuffer = enumerator.detailBuffer[:requiredSize]
+	*(*uint32)(unsafe.Pointer(&enumerator.detailBuffer[0])) = detailDataCBSize()
 
 	r1, _, err = procSetupDiGetDeviceInterfaceDetailW.Call(
 		uintptr(infoSet),
 		uintptr(unsafe.Pointer(&interfaceData)),
-		uintptr(unsafe.Pointer(&buffer[0])),
+		uintptr(unsafe.Pointer(&enumerator.detailBuffer[0])),
 		uintptr(requiredSize),
 		uintptr(unsafe.Pointer(&requiredSize)),
 		0,
@@ -244,7 +316,7 @@ func setupDiEnumDeviceInterfacePath(infoSet windows.Handle, classGUID *windows.G
 		return "", err
 	}
 
-	pathPtr := (*uint16)(unsafe.Pointer(uintptr(unsafe.Pointer(&buffer[0])) + unsafe.Sizeof(uint32(0))))
+	pathPtr := (*uint16)(unsafe.Pointer(uintptr(unsafe.Pointer(&enumerator.detailBuffer[0])) + unsafe.Sizeof(uint32(0))))
 	return windows.UTF16PtrToString(pathPtr), nil
 }
 
@@ -285,8 +357,8 @@ func hidGetCaps(handle windows.Handle) (hidpCaps, error) {
 	return caps, nil
 }
 
-func hidGetString(handle windows.Handle, proc *windows.LazyProc) (string, error) {
-	buf := make([]uint16, 126)
+func hidGetString(handle windows.Handle, proc *windows.LazyProc, buf []uint16) (string, error) {
+	buf[0] = 0
 	r1, _, err := proc.Call(uintptr(handle), uintptr(unsafe.Pointer(&buf[0])), uintptr(len(buf)*2))
 	if r1 == 0 {
 		return "", err
@@ -311,6 +383,9 @@ func hidGetFeature(handle windows.Handle, report []byte) error {
 }
 
 func deviceLabel(device hidDeviceInfo) string {
+	if device.DisplayLabel != "" {
+		return device.DisplayLabel
+	}
 	if device.Product != "" {
 		return device.Product
 	}
@@ -320,8 +395,41 @@ func deviceLabel(device hidDeviceInfo) string {
 	return device.Path
 }
 
+func deviceSortKey(device hidDeviceInfo) string {
+	if device.SortKey != "" {
+		return device.SortKey
+	}
+	return strings.ToLower(deviceLabel(device))
+}
+
+func deviceKey(device hidDeviceInfo) string {
+	if device.NormalizedKey != "" {
+		return device.NormalizedKey
+	}
+	return normalizeDeviceKey(device.Path, device.VendorID, device.ProductID)
+}
+
 func normalizeDeviceKey(path string, vendorID uint16, productID uint16) string {
 	normalized := strings.ToLower(path)
-	normalized = collectionSuffixRE.ReplaceAllString(normalized, "")
+	normalized = stripCollectionSuffix(normalized)
 	return fmt.Sprintf("%04x:%04x:%s", vendorID, productID, normalized)
+}
+
+func stripCollectionSuffix(path string) string {
+	length := len(path)
+	if length < 6 {
+		return path
+	}
+	index := length - 6
+	if path[index] != '&' || path[index+1] != 'c' || path[index+2] != 'o' || path[index+3] != 'l' {
+		return path
+	}
+	if !isHex(path[index+4]) || !isHex(path[index+5]) {
+		return path
+	}
+	return path[:index]
+}
+
+func isHex(value byte) bool {
+	return (value >= '0' && value <= '9') || (value >= 'a' && value <= 'f')
 }
